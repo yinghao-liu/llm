@@ -4,3 +4,4 @@
 ## 003 [mcp and tools](003)
 
 ## 101 [VIDEO RAG](101)
+## 102 [IMAGE RAG](102)
