@@ -11,12 +11,14 @@ from pathlib import Path
 
 import numpy as np
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageTk
+import tkinter as tk
+
 
 # ---------- 模型配置 ----------
 MODEL_CAPTION = "qwen/qwen3-vl-4b"      # 生成 caption
 MODEL_EMBED = "text-embedding-bge-m3"  # caption/query 向量化
-MODEL_ANSWER = "qwen/qwen3-vl-4b"       # 最终读图回答，可换 gpt-4o-mini 省钱
+MODEL_ANSWER = "qwen/qwen3-vl-4b"       # 最终读图回答
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 
@@ -31,6 +33,27 @@ def encode_image(path: Path, max_side: int = 1024) -> str:
     img.save(buf, format="JPEG", quality=85)
     b64 = base64.b64encode(buf.getvalue()).decode()
     return f"data:image/jpeg;base64,{b64}"
+
+def show_image(path, max_scale=0.9):
+    root = tk.Tk()
+    root.title("图片预览")
+    # 1. 获取屏幕可用区域（自动去掉任务栏）
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    # 2. 打开图片并按比例缩放到屏幕的 max_scale 倍以内
+    img = Image.open(path)
+    ratio = min(screen_w * max_scale / img.width,
+                screen_h * max_scale / img.height, 1.0)  # 不放大
+    new_size = (int(img.width * ratio), int(img.height * ratio))
+    img = img.resize(new_size, Image.LANCZOS)
+    photo = ImageTk.PhotoImage(img)
+    label = tk.Label(root, image=photo)
+    label.pack()
+    # 3. 等待用户操作：点击或按任意键 / Esc 关闭
+    root.bind("<Button>", lambda e: root.destroy())
+    root.bind("<Key>", lambda e: root.destroy())
+    root.focus_set()
+    root.mainloop()   # 阻塞在这里，直到窗口关闭
 
 
 CAPTION_SYSTEM = """你是图像检索系统的标注员。请为图片生成用于"以文搜图"的结构化描述。
@@ -82,8 +105,8 @@ def generate_caption(client: OpenAI, image_url: str) -> dict:
 def to_document(cap: dict) -> str:
     """把结构化 caption 拼成一段用于检索的文本"""
     parts = [cap["caption"]]
-    # if cap["tags"]:
-    #     parts.append("标签: " + "、".join(cap["tags"]))
+    if cap["tags"]:
+        parts.append("标签: " + "、".join(cap["tags"]))
     # if cap["ocr"]:
     #     parts.append("图片文字: " + cap["ocr"])
     return "\n".join(parts)
@@ -206,12 +229,26 @@ class ImageRAG:
 
 # ---------- 演示入口 ----------
 if __name__ == "__main__":
-    rag = ImageRAG("../../../resource/image/")     # 图片目录
+    rag = ImageRAG("../../resource/image/")     # 图片目录
     rag.build()                    # 首次会调用 API 生成 caption，之后走缓存
 
-    print("\n以文搜图 Top3:")
-    for h in rag.search("小狗奔跑", topk=3):
-        print(f"  {h['score']:.3f}  {h['path']}")
+    # print("\n以文搜图 Top3:")
+    # for h in rag.search("天上的云彩", topk=3):
+    #     print(f"  {h['score']:.3f}  {h['path']}")
+    
+    # 交互式查询
+    print("\n" + "=" * 72)
+    while True:
+        q = input("\n输入检索问句(回车退出): ").strip()
+        if not q:
+            break
+        for h in rag.search(q, topk=3):
+            print(f"  {h['score']:.3f}  {h['path']}")
+            if h['score']  < 0.6:
+                break
+            # img = Image.open(h['path'])
+            # img.show()
+            show_image(h['path'])
 
     # print("\nImage RAG 回答:")
     # print(rag.answer("小狗奔跑的图片", topk=3, use_rerank=True))
