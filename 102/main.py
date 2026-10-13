@@ -3,7 +3,7 @@ Caption-based Image RAG
 索引: 图片 -> GPT-4o-mini 生成结构化 caption -> 文本向量 -> 向量索引
 检索: query -> 文本向量 -> 相似度 TopK -> (可选 rerank) -> GPT-4o 读图回答
 """
-
+# import os
 import base64
 import io
 import json
@@ -14,11 +14,17 @@ from openai import OpenAI
 from PIL import Image, ImageTk
 import tkinter as tk
 
+import jieba
+from rank_bm25 import BM25Okapi
+# from sentence_transformers import CrossEncoder
+
+
 
 # ---------- 模型配置 ----------
 MODEL_CAPTION = "qwen/qwen3-vl-4b"      # 生成 caption
 MODEL_EMBED = "text-embedding-bge-m3"  # caption/query 向量化
 MODEL_ANSWER = "qwen/qwen3-vl-4b"       # 最终读图回答
+# MODEL_RERANK = "BAAI/bge-reranker-v2-m3"    # rerank
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 
@@ -55,6 +61,11 @@ def show_image(path, max_scale=0.9):
     root.focus_set()
     root.mainloop()   # 阻塞在这里，直到窗口关闭
 
+
+STOPWORDS = set("的 了 在 是 和 有 与 及 请 为 这 那 上 一只 一个".split())
+def tokenize(text: str) -> list[str]:
+    return [w for w in jieba.lcut(text)
+            if w.strip() and w not in STOPWORDS and len(w.strip()) > 1]
 
 CAPTION_SYSTEM = """你是图像检索系统的标注员。请为图片生成用于"以文搜图"的结构化描述。
 要求：
@@ -102,13 +113,13 @@ def generate_caption(client: OpenAI, image_url: str) -> dict:
     }
 
 
-def to_document(cap: dict) -> str:
+def to_description(des: dict) -> str:
     """把结构化 caption 拼成一段用于检索的文本"""
-    parts = [cap["caption"]]
-    if cap["tags"]:
-        parts.append("标签: " + "、".join(cap["tags"]))
-    # if cap["ocr"]:
-    #     parts.append("图片文字: " + cap["ocr"])
+    parts = [des["caption"]]
+    if des["tags"]:
+        parts.append("标签: " + "、".join(des["tags"]))
+    if des["ocr"]:
+        parts.append("图片文字: " + des["ocr"])
     return "\n".join(parts)
 
 
@@ -128,6 +139,9 @@ class ImageRAG:
         self.paths: list[Path] = []
         self.docs: list[str] = []
         self.vecs: np.ndarray | None = None
+        self.bm25 = None
+        # self.rerank = CrossEncoder(MODEL_RERANK, max_length=512)
+
 
     # ---- 索引阶段 ----
     def build(self):
@@ -137,7 +151,7 @@ class ImageRAG:
         if not paths:
             raise ValueError(f"{self.image_dir} 下没有图片")
 
-        kept, docs = [], []
+        kept, caps, tags = [], [], []
         for p in paths:
             key = str(p.relative_to(self.image_dir))
             mtime = p.stat().st_mtime
@@ -149,17 +163,25 @@ class ImageRAG:
                 except Exception as e:                      # 单张失败不中断整体
                     print(f"[warn] caption 失败 {p}: {e}")
                     continue
-                cached = {"mtime": mtime, "cap": cap}
+                cached = {"mtime": mtime, "description": cap}
                 self.cache[key] = cached
                 self._save_cache()                          # 每张存一次，崩溃也不丢
                 print(f"[caption] {key}: {cap['caption'][:30]}...")
 
             kept.append(p)
-            docs.append(to_document(cached["cap"]))
+            # docs.append(to_document(cached["description"]))
+            caps.append(cached["description"]["caption"])
+            tags.append(cached["description"]["tags"])
 
-        self.paths, self.docs = kept, docs
-        self.vecs = l2_normalize(self._embed(docs))
-        print(f"索引完成: {len(kept)} 张图片")
+        # 向量索引
+        self.paths, self.docs = kept, caps
+        self.vecs = l2_normalize(self._embed(caps))
+        print(f"embedding 索引完成: {len(kept)} 张图片")
+
+        # bm25关键词索引 TODO tags + ocr
+        self.bm25 = BM25Okapi(tags)
+        print(f"BM25 索引完成: {len(tags)} 张图片")
+
 
     def _embed(self, texts: list[str]) -> np.ndarray:
         out = []
@@ -227,6 +249,74 @@ class ImageRAG:
         return resp.choices[0].message.content
 
 
+
+    # ---- 检索：向量 + BM25 两路召回，RRF 融合 ----
+    def search_hybrid(self, query: str, topk: int = 5, k: int = 20) -> list[dict]:
+        # 第一路：稠密向量（语义）
+        vec_hits = self.search(query, topk=10)
+        vec_rank = {h["path"]:h["score"] for h in vec_hits}
+        # print(caption_map)
+        print(f"--vec_rank-- {vec_rank}")
+
+
+        # 第二路：BM25（词法）
+        kw_scores = self.bm25.get_scores(tokenize(query))
+        # kw_scores = 1 / (1 + np.exp(-scores))
+        # print(f"--scores-- {scores}")
+        # print(f"--kw_scores-- {kw_scores}")
+        kw_rank = {str(self.paths[i]):float(kw_scores[i])
+                    for i in np.argsort(-kw_scores)[:10] if kw_scores[i] > 0}
+        print(f"--kw_rank-- {kw_rank}")
+
+        return [{"path": path, "score": vec_rank[path] + kw_rank.get(path, 0)} for path in vec_rank]
+
+
+    def search_hybrid_bak(self, query: str, topk: int = 5, k: int = 20) -> list[dict]:
+        
+        # 第一路：稠密向量（语义）
+        vec_hits = self.search(query, topk=10)
+        vec_rank = [h["path"] for h in vec_hits]
+        # print(caption_map)
+        print(f"--vec_rank-- {vec_rank}")
+
+
+        # 第二路：BM25（词法）
+        kw_scores = self.bm25.get_scores(tokenize(query))
+        kw_rank = [str(self.paths[i])
+                   for i in np.argsort(-kw_scores)[:10] if kw_scores[i] > 0]
+        print(f"--kw_rank-- {kw_rank}")
+
+        # RRF 融合：score = Σ 1/(k + rank)，对排名融合而非对分数融合
+        # rrf = {}
+        # for rank, path in enumerate(vec_rank):
+        #     rrf[path] = rrf.get(path, 0) + 1 / (k + rank + 1)
+        # for rank, path in enumerate(kw_rank):
+        #     rrf[path] = rrf.get(path, 0) + 1 / (k + rank + 1)
+        # top = sorted(rrf, key=rrf.get, reverse=True)[:topk]
+        # print(f"rrf:{rrf}")
+        # print(top)
+
+        # rerank
+        # pairs = [('什么是重排序？', '重排序是对候选文档重新排序的过程'),
+        #         ('什么是重排序？', '今天天气晴朗')]
+        # description_map = {}
+        # for i in top:
+        #     name = os.path.basename(i)
+        #     description_map[i] = to_description(rag.cache[name]["description"])
+        # caption_map = {h["path"]:h["caption"] for h in vec_hits}
+
+        # pairs = [(query, description_map[i]) for i in top]
+        # print(f"pairs:{pairs}")
+        # scores = self.rerank.predict(pairs)                  # numpy array，logits
+        # print(f"scores:{scores}")
+        # # 转 0~1 概率
+        # probs = 1 / (1 + np.exp(-scores))
+        # print(probs)
+        # return [{"path": path, "score": probs[index]} for index,path in enumerate(top)]
+
+
+
+
 # ---------- 演示入口 ----------
 if __name__ == "__main__":
     rag = ImageRAG("../../resource/image/")     # 图片目录
@@ -235,19 +325,17 @@ if __name__ == "__main__":
     # print("\n以文搜图 Top3:")
     # for h in rag.search("天上的云彩", topk=3):
     #     print(f"  {h['score']:.3f}  {h['path']}")
-    
+    # print(rag.cache)
     # 交互式查询
     print("\n" + "=" * 72)
     while True:
         q = input("\n输入检索问句(回车退出): ").strip()
         if not q:
             break
-        for h in rag.search(q, topk=3):
+        for h in rag.search_hybrid(q, topk=3):
             print(f"  {h['score']:.3f}  {h['path']}")
             if h['score']  < 0.6:
-                break
-            # img = Image.open(h['path'])
-            # img.show()
+                continue
             show_image(h['path'])
 
     # print("\nImage RAG 回答:")
